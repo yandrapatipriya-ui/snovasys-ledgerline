@@ -2,6 +2,7 @@ const express = require('express');
 const { PrismaClient } = require('@prisma/client');
 const bcrypt = require('bcryptjs');
 const jwt = require('jsonwebtoken');
+const rateLimit = require('express-rate-limit');
 
 const prisma = new PrismaClient();
 const app = express();
@@ -10,6 +11,14 @@ app.use(express.json());
 app.use(express.static('public'));
 
 const JWT_SECRET = process.env.JWT_SECRET || 'ledgerline_super_secret_key_2026';
+
+// 1. Rate Limiter (Snovasys Requirement)
+const apiLimiter = rateLimit({
+  windowMs: 15 * 60 * 1000, // 15 minutes
+  max: 100, // Limit each IP to 100 requests per windowMs
+  message: { error: "Too many requests from this IP, please try again later." }
+});
+app.use('/api/', apiLimiter);
 
 function authenticateToken(req, res, next) {
   const authHeader = req.headers['authorization'];
@@ -23,6 +32,47 @@ function authenticateToken(req, res, next) {
   });
 }
 
+// 2. RBAC Middleware (Admin role verification)
+function requireAdmin(req, res, next) {
+  if (!req.user || req.user.role !== 'ADMIN') {
+    return res.status(403).json({ error: 'Access denied. Admin privileges required.' });
+  }
+  next();
+}
+
+// 3. Health Check Endpoint (Render deployment verification)
+app.get('/api/health', async (req, res) => {
+  try {
+    await prisma.$queryRaw`SELECT 1`;
+    res.status(200).json({ status: 'UP', database: 'Connected', timestamp: new Date() });
+  } catch (error) {
+    res.status(500).json({ status: 'DOWN', error: error.message });
+  }
+});
+
+// 4. First-Admin Bootstrap Script (Fixed string syntax error)
+async function bootstrapAdmin() {
+  try {
+    const adminEmail = process.env.ADMIN_EMAIL || 'admin@ledgerline.com';
+    const existingAdmin = await prisma.user.findFirst({ where: { role: 'ADMIN' } });
+    
+    if (!existingAdmin) {
+      const hashedPassword = await bcrypt.hash(process.env.ADMIN_PASSWORD || 'Admin@123', 10);
+      
+      await prisma.user.create({
+        data: {
+          email: adminEmail,
+          password: hashedPassword,
+          role: 'ADMIN'
+        }
+      });
+      console.log(`> Default Admin bootstrapped successfully: ${adminEmail}`);
+    }
+  } catch (err) {
+    console.error("Bootstrap admin warning (Check if 'role' field exists in Prisma schema):", err.message);
+  }
+}
+
 // 1. REGISTER
 app.post('/api/auth/register', async (req, res) => {
   const { email, password } = req.body;
@@ -33,7 +83,7 @@ app.post('/api/auth/register', async (req, res) => {
     const accountNumber = 'ACC' + Math.floor(10000000 + Math.random() * 90000000);
 
     const result = await prisma.$transaction(async (tx) => {
-      const user = await tx.user.create({ data: { email, password: hashedPassword } });
+      const user = await tx.user.create({ data: { email, password: hashedPassword, role: 'USER' } });
       const account = await tx.account.create({
         data: { userId: user.id, accountNumber, balance: 0n }
       });
@@ -54,7 +104,7 @@ app.post('/api/auth/login', async (req, res) => {
     if (!user || !(await bcrypt.compare(password, user.password))) {
       return res.status(401).json({ error: 'Invalid email or password.' });
     }
-    const token = jwt.sign({ userId: user.id, email: user.email }, JWT_SECRET, { expiresIn: '12h' });
+    const token = jwt.sign({ userId: user.id, email: user.email, role: user.role || 'USER' }, JWT_SECRET, { expiresIn: '12h' });
     res.json({ message: 'Login successful.', token });
   } catch (err) {
     res.status(500).json({ error: err.message });
@@ -101,7 +151,7 @@ app.post('/api/deposit', authenticateToken, async (req, res) => {
   }
 });
 
-// 5. WITHDRAW (Fixed & Added)
+// 5. WITHDRAW
 app.post('/api/withdraw', authenticateToken, async (req, res) => {
   const { amount } = req.body;
   if (!amount || amount <= 0) return res.status(400).json({ error: 'Invalid withdrawal amount.' });
@@ -185,7 +235,7 @@ app.post('/api/transfer', authenticateToken, async (req, res) => {
   }
 });
 
-// 7. STATEMENT / HISTORY (Fixed GET method)
+// 7. STATEMENT / HISTORY
 app.get('/api/statement', authenticateToken, async (req, res) => {
   try {
     const account = await prisma.account.findUnique({ where: { userId: req.user.userId } });
@@ -210,8 +260,8 @@ app.get('/api/statement', authenticateToken, async (req, res) => {
   }
 });
 
-// 8. ADMIN MASTER LEDGER
-app.get('/api/admin/ledger', authenticateToken, async (req, res) => {
+// 8. ADMIN MASTER LEDGER (Protected with RBAC `requireAdmin`)
+app.get('/api/admin/ledger', authenticateToken, requireAdmin, async (req, res) => {
   try {
     const ledgers = await prisma.ledger.findMany({ orderBy: { createdAt: 'desc' }, take: 50 });
     const formatted = ledgers.map(l => ({
@@ -229,6 +279,7 @@ app.get('/api/admin/ledger', authenticateToken, async (req, res) => {
 });
 
 const PORT = process.env.PORT || 5000;
-app.listen(PORT, () => {
+app.listen(PORT, async () => {
   console.log(`LedgerLine server running on http://localhost:${PORT}`);
+  await bootstrapAdmin();
 });

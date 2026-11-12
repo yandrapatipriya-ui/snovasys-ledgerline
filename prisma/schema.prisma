@@ -11,6 +11,7 @@ model User {
   id        String   @id @default(uuid())
   email     String   @unique
   password  String
+  role      String   @default("USER")   // <-- Added for RBAC & Admin bootstrap
   createdAt DateTime @default(now())
   account   Account?
 }
